@@ -406,6 +406,7 @@ object DeltaWriter extends StrictLogging {
     import org.locationtech.geomesa.utils.conversions.ScalaImplicits.RichArray
 
     val dictionaries = mergedDictionaries.dictionaries
+    //val sortIsDate = sft.getDescriptor(sortBy).getType.getBinding == classOf[java.util.Date]
 
     // gets the attribute we're sorting by from the i-th feature in the vector
     val getSortAttribute: (ArrowAttributeReader, scala.collection.Map[Integer, Integer], Int) => AnyRef = {
@@ -413,7 +414,15 @@ object DeltaWriter extends StrictLogging {
         // since we've sorted the dictionaries, we can just compare the encoded index values
         (reader, mappings, i) => mappings(reader.asInstanceOf[ArrowDictionaryReader].getEncoded(i))
       } else {
-        (reader, _, i) => reader.apply(i)
+        (reader, _, i) =>
+            reader.apply(i)
+
+//        (reader, _, i) =>
+//          if (sortIsDate) {
+//            reader.asInstanceOf[ArrowDateReader].getTime(i).asInstanceOf[AnyRef]
+//          } else {
+//            reader.apply(i)
+//          }
       }
     }
 
