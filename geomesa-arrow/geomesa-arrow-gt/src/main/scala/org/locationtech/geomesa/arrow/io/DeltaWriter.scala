@@ -10,6 +10,7 @@ package org.locationtech.geomesa.arrow.io
 
 import java.io.{ByteArrayOutputStream, Closeable, OutputStream}
 import java.nio.channels.Channels
+import java.util.PriorityQueue
 import java.util.concurrent.ThreadLocalRandom
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -288,7 +289,8 @@ object DeltaWriter extends StrictLogging {
                   to.setSafe(toIndex, mapping(n))
                 }
               }
-            } else if (SimpleFeatureVector.isGeometryVector(fromVector)) {
+            } else if (classOf[Geometry].isAssignableFrom(sft.getDescriptor(fromVector.getField.getName).getType.getBinding)) {
+//            } else if (SimpleFeatureVector.isGeometryVector(fromVector)) {
               // geometry vectors use FixedSizeList vectors, for which transfer pairs aren't implemented
               val from = GeometryFields.wrap(fromVector).asInstanceOf[GeometryVector[Geometry, FieldVector]]
               val to = GeometryFields.wrap(toVector).asInstanceOf[GeometryVector[Geometry, FieldVector]]
@@ -464,7 +466,8 @@ object DeltaWriter extends StrictLogging {
                 to.setSafe(toIndex, mapping(n))
               }
             }
-          } else if (SimpleFeatureVector.isGeometryVector(fromVector)) {
+          } else if (classOf[Geometry].isAssignableFrom(sft.getDescriptor(fromVector.getField.getName).getType.getBinding)) {
+              //          } else if (SimpleFeatureVector.isGeometryVector(fromVector)) {
             // geometry vectors use FixedSizeList vectors, for which transfer pairs aren't implemented
             val from = GeometryFields.wrap(fromVector).asInstanceOf[GeometryVector[Geometry, FieldVector]]
             val to = GeometryFields.wrap(toVector).asInstanceOf[GeometryVector[Geometry, FieldVector]]
@@ -487,14 +490,15 @@ object DeltaWriter extends StrictLogging {
 
     // we do a merge sort of each batch
     // sorted queue of [(current batch value, number of the batch, current index in that batch)]
-    val queue = {
-      val o = if (reverse) { queueOrdering.reverse } else { queueOrdering }
-      scala.collection.mutable.PriorityQueue.empty[(AnyRef, Int, Int)](o)
+    val queue: PriorityQueue[(AnyRef, Int, Int)] = {
+      val o: Ordering[(AnyRef, Int, Int)] = if (reverse) { queueOrdering.reverse } else { queueOrdering }
+      new PriorityQueue[(AnyRef, Int, Int)](o)
+      //scala.collection.mutable.PriorityQueue.empty[(AnyRef, Int, Int)](o)
     }
 
     toMerge.foreachIndex { case ((vector, sort, _, mappings), i) =>
       if (vector.reader.getValueCount > 0) {
-        queue += ((getSortAttribute(sort, mappings, 0), i, 0))
+        queue.add((getSortAttribute(sort, mappings, 0), i, 0))
       }
     }
 
@@ -507,7 +511,7 @@ object DeltaWriter extends StrictLogging {
         var resultIndex = 0
         // copy the next sorted value and then queue and sort the next element out of the batch we copied from
         do {
-          val (_, batch, i) = queue.dequeue()
+          val (_, batch, i) = queue.remove()
           val (vector, sort, transfers, mappings) = toMerge(batch)
           transfers.foreach(_.apply(i, resultIndex))
           result.underlying.setIndexDefined(resultIndex)
@@ -515,9 +519,9 @@ object DeltaWriter extends StrictLogging {
           val nextBatchIndex = i + 1
           if (vector.reader.getValueCount > nextBatchIndex) {
             val value = getSortAttribute(sort, mappings, nextBatchIndex)
-            queue += ((value, batch, nextBatchIndex))
+            queue.add((value, batch, nextBatchIndex))
           }
-        } while (queue.nonEmpty && resultIndex < batchSize)
+        } while (!queue.isEmpty && resultIndex < batchSize)
 
         if (writtenHeader) {
           unloader.unload(resultIndex)
