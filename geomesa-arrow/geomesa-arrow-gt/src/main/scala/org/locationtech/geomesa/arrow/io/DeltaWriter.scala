@@ -467,7 +467,9 @@ object DeltaWriter extends StrictLogging {
               val mapping = mappings(fromVector.getField.getName)
               val to = toVector.asInstanceOf[IntVector]
               (fromIndex: Int, toIndex: Int) => {
-                val n = fromVector.getObject(fromIndex).asInstanceOf[Integer]
+                val n = result.synchronized {
+                  fromVector.getObject(fromIndex).asInstanceOf[Integer]
+                }
                 if (n == null) {
                   to.setNull(toIndex)
                 } else {
@@ -480,10 +482,14 @@ object DeltaWriter extends StrictLogging {
               val from = GeometryFields.wrap(fromVector).asInstanceOf[GeometryVector[Geometry, FieldVector]]
               val to = GeometryFields.wrap(toVector).asInstanceOf[GeometryVector[Geometry, FieldVector]]
               (fromIndex: Int, toIndex: Int) => {
-                from.transfer(fromIndex, toIndex, to)
+                result.synchronized {
+                  from.transfer(fromIndex, toIndex, to)
+                }
               }
             } else {
-              val transfer = fromVector.makeTransferPair(toVector)
+              val transfer = result.synchronized {
+                fromVector.makeTransferPair(toVector)
+              }
               (fromIndex: Int, toIndex: Int) => transfer.copyValueSafe(fromIndex, toIndex)
             }
           }
@@ -568,7 +574,7 @@ object DeltaWriter extends StrictLogging {
       }
 
       // JNH: Let's try and make sure that we don't get two threads calling close at the same instant.
-      override def close(): Unit = this.synchronized {
+      override def close(): Unit = result.synchronized {
         CloseWithLogging(result)
         toMerge.foreach { case (vector, _,  _, _) => CloseWithLogging(vector) }
         CloseWithLogging(mergedDictionaries)
