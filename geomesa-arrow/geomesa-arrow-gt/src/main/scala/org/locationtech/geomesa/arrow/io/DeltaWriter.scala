@@ -267,6 +267,7 @@ object DeltaWriter extends StrictLogging {
 
     val iter: CloseableIterator[Array[Byte]] = new CloseableIterator[Array[Byte]] {
       private var writeHeader = true
+      // JNH: Do we need to synchronize these?!
       private val toLoad = SimpleFeatureVector.create(sft, mergedDictionaries.dictionaries, encoding, batchSize)
       private val result = SimpleFeatureVector.create(sft, mergedDictionaries.dictionaries, encoding, batchSize)
       logger.trace(s"merge unsorted deltas - read schema ${result.underlying.getField}")
@@ -428,7 +429,7 @@ object DeltaWriter extends StrictLogging {
     }
 
     // JNH: This one is silly, right?
-    val result = synchronized {
+    val result: SimpleFeatureVector = synchronized {
       SimpleFeatureVector.create(sft, dictionaries, encoding)
     }
     val unloader = new RecordBatchUnloader(result)
@@ -536,7 +537,9 @@ object DeltaWriter extends StrictLogging {
         } while (!queue.isEmpty && resultIndex < batchSize)
 
         if (writtenHeader) {
-          unloader.unload(resultIndex)
+          result.synchronized {
+            unloader.unload(resultIndex)
+          }
         } else {
           // write the header in the first result, which includes the metadata and dictionaries
           writtenHeader = true
