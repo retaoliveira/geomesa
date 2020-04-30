@@ -58,7 +58,7 @@ class SimpleFeatureVector private [arrow] (
 
   override def close(): Unit = {
     CloseWithLogging.raise(Seq(underlying))
-    allocator.synchronized {
+    this.synchronized {
       allocator.foreach { CloseWithLogging.raise(_) }
     }
   }
