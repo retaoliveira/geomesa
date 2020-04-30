@@ -459,17 +459,15 @@ object DeltaWriter extends StrictLogging {
         loader.load(batch, offset, messageLength)
         val transfers: Seq[(Int, Int) => Unit] = toLoad.underlying.getChildrenFromFields.asScala.map { fromVector =>
           // JNH: Buckshot sync'ing.
-          fromVector.synchronized {
+          result.synchronized {
             val toVector = result.synchronized {
               result.underlying.getChild(fromVector.getField.getName)
             }
             if (fromVector.getField.getDictionary != null) {
               val mapping = mappings(fromVector.getField.getName)
               val to = toVector.asInstanceOf[IntVector]
-              (fromIndex: Int, toIndex: Int) => {
-                val n = result.synchronized {
-                  fromVector.getObject(fromIndex).asInstanceOf[Integer]
-                }
+              (fromIndex: Int, toIndex: Int) => result.synchronized {
+                val n = fromVector.getObject(fromIndex).asInstanceOf[Integer]
                 if (n == null) {
                   to.setNull(toIndex)
                 } else {
@@ -481,16 +479,14 @@ object DeltaWriter extends StrictLogging {
               // geometry vectors use FixedSizeList vectors, for which transfer pairs aren't implemented
               val from = GeometryFields.wrap(fromVector).asInstanceOf[GeometryVector[Geometry, FieldVector]]
               val to = GeometryFields.wrap(toVector).asInstanceOf[GeometryVector[Geometry, FieldVector]]
-              (fromIndex: Int, toIndex: Int) => {
-                result.synchronized {
-                  from.transfer(fromIndex, toIndex, to)
-                }
+              (fromIndex: Int, toIndex: Int) => result.synchronized {
+                from.transfer(fromIndex, toIndex, to)
               }
             } else {
               val transfer = result.synchronized {
                 fromVector.makeTransferPair(toVector)
               }
-              (fromIndex: Int, toIndex: Int) => transfer.copyValueSafe(fromIndex, toIndex)
+              (fromIndex: Int, toIndex: Int) => result.synchronized { transfer.copyValueSafe(fromIndex, toIndex) }
             }
           }
         }
@@ -511,9 +507,11 @@ object DeltaWriter extends StrictLogging {
       //scala.collection.mutable.PriorityQueue.empty[(AnyRef, Int, Int)](o)
     }
 
-    toMerge.foreachIndex { case ((vector, sort, _, mappings), i) =>
-      if (vector.reader.getValueCount > 0) {
-        queue.add((getSortAttribute(sort, mappings, 0), i, 0))
+    result.synchronized {
+      toMerge.foreachIndex { case ((vector, sort, _, mappings), i) =>
+        if (vector.reader.getValueCount > 0) {
+          queue.add((getSortAttribute(sort, mappings, 0), i, 0))
+        }
       }
     }
 
@@ -530,15 +528,15 @@ object DeltaWriter extends StrictLogging {
         do {
           val (_, batch, i) = queue.remove()
           val (vector, sort, transfers, mappings) = toMerge(batch)
-          transfers.foreach(_.apply(i, resultIndex))
           result.synchronized {
+            transfers.foreach(_.apply(i, resultIndex))
             result.underlying.setIndexDefined(resultIndex)
-          }
-          resultIndex += 1
-          val nextBatchIndex = i + 1
-          if (vector.reader.getValueCount > nextBatchIndex) {
-            val value = getSortAttribute(sort, mappings, nextBatchIndex)
-            queue.add((value, batch, nextBatchIndex))
+            resultIndex += 1
+            val nextBatchIndex = i + 1
+            if (vector.reader.getValueCount > nextBatchIndex) {
+              val value = getSortAttribute(sort, mappings, nextBatchIndex)
+              queue.add((value, batch, nextBatchIndex))
+            }
           }
         } while (!queue.isEmpty && resultIndex < batchSize)
 
