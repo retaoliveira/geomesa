@@ -36,6 +36,7 @@ import org.locationtech.jts.geom.Geometry
 import org.opengis.feature.simple.{SimpleFeature, SimpleFeatureType}
 
 import scala.annotation.tailrec
+import scala.collection.mutable.ArrayBuffer
 import scala.math.Ordering
 
 /**
@@ -289,8 +290,8 @@ object DeltaWriter extends StrictLogging {
                   to.setSafe(toIndex, mapping(n))
                 }
               }
-            } else if (classOf[Geometry].isAssignableFrom(sft.getDescriptor(fromVector.getField.getName).getType.getBinding)) {
-//            } else if (SimpleFeatureVector.isGeometryVector(fromVector)) {
+            } else if (sft.indexOf(name) != -1 &&
+                classOf[Geometry].isAssignableFrom(sft.getDescriptor(name).getType.getBinding)) {
               // geometry vectors use FixedSizeList vectors, for which transfer pairs aren't implemented
               val from = GeometryFields.wrap(fromVector).asInstanceOf[GeometryVector[Geometry, FieldVector]]
               val to = GeometryFields.wrap(toVector).asInstanceOf[GeometryVector[Geometry, FieldVector]]
@@ -409,28 +410,19 @@ object DeltaWriter extends StrictLogging {
     import org.locationtech.geomesa.utils.conversions.ScalaImplicits.RichArray
 
     val dictionaries = mergedDictionaries.dictionaries
-    val sortIsDate = sft.getDescriptor(sortBy).getType.getBinding == classOf[java.util.Date]
-
-    // gets the attribute we're sorting by from the i-th feature in the vector
-    val getSortAttribute: (ArrowAttributeReader, scala.collection.Map[Integer, Integer], Int) => AnyRef = {
-      if (dictionaries.contains(sortBy)) {
-        // since we've sorted the dictionaries, we can just compare the encoded index values
-        (reader, mappings, i) => mappings(reader.asInstanceOf[ArrowDictionaryReader].getEncoded(i))
-      } else if (sortIsDate) {
-        (reader, _, i) => reader.asInstanceOf[ArrowDateReader].getTime(i).asInstanceOf[AnyRef]
-      } else {
-        (reader, _, i) => reader.apply(i)
-      }
-    }
 
     val result = SimpleFeatureVector.create(sft, dictionaries, encoding)
     val unloader = new RecordBatchUnloader(result)
 
     logger.trace(s"merging sorted deltas - read schema: ${result.underlying.getField}")
 
-    // builder for our merge array - (vector, reader for sort values, transfers to result, dictionary mappings)
-    val mergeBuilder = Array.newBuilder[(SimpleFeatureVector, ArrowAttributeReader, Seq[(Int, Int) => Unit], scala.collection.Map[Integer, Integer])]
-    mergeBuilder.sizeHint(threadedBatches.foldLeft(0)((sum, a) => sum + a.length))
+    // we do a merge sort of each batch
+    // queue sorted by current value in each batch
+    val queue =
+      new PriorityQueue[BatchMerger[Any]](if (reverse) { BatchMergerOrdering.reverse } else { BatchMergerOrdering })
+
+    val cleanup = ArrayBuffer.empty[SimpleFeatureVector]
+    cleanup.sizeHint(threadedBatches.foldLeft(0)((sum, a) => sum + a.length))
 
     threadedBatches.foreachIndex { case (batches, batchIndex) =>
       val mappings = mergedDictionaries.mappings.map { case (f, m) => (f, m(batchIndex)) }
@@ -439,6 +431,7 @@ object DeltaWriter extends StrictLogging {
       batches.foreach { batch =>
         val toLoad = SimpleFeatureVector.create(sft, dictionaries, encoding)
         val loader = new RecordBatchLoader(toLoad.underlying)
+        cleanup += toLoad
 
         // skip the dictionary batches
         var offset = 8
@@ -449,50 +442,41 @@ object DeltaWriter extends StrictLogging {
         offset += 4 // skip the length bytes
         // load the record batch
         loader.load(batch, offset, messageLength)
-        val transfers: Seq[(Int, Int) => Unit] = toLoad.underlying.getChildrenFromFields.asScala.map { fromVector =>
-          val toVector = result.underlying.getChild(fromVector.getField.getName)
-          if (fromVector.getField.getDictionary != null) {
-            val mapping = mappings(fromVector.getField.getName)
-            val to = toVector.asInstanceOf[IntVector]
-            (fromIndex: Int, toIndex: Int) => {
-              val n = fromVector.getObject(fromIndex).asInstanceOf[Integer]
-              if (n == null) {
-                to.setNull(toIndex)
-              } else {
-                to.setSafe(toIndex, mapping(n))
+        if (toLoad.reader.getValueCount > 0) {
+          val transfers: Seq[(Int, Int) => Unit] = toLoad.underlying.getChildrenFromFields.asScala.map { fromVector =>
+            val name = fromVector.getField.getName
+            val toVector = result.underlying.getChild(name)
+            if (fromVector.getField.getDictionary != null) {
+              val mapping = mappings(name)
+              val to = toVector.asInstanceOf[IntVector]
+              (fromIndex: Int, toIndex: Int) => {
+                val n = fromVector.getObject(fromIndex).asInstanceOf[Integer]
+                if (n == null) {
+                  to.setNull(toIndex)
+                } else {
+                  to.setSafe(toIndex, mapping(n))
+                }
               }
+            } else if (sft.indexOf(name) != -1 &&
+                classOf[Geometry].isAssignableFrom(sft.getDescriptor(name).getType.getBinding)) {
+              // geometry vectors use FixedSizeList vectors, for which transfer pairs aren't implemented
+              val from = GeometryFields.wrap(fromVector).asInstanceOf[GeometryVector[Geometry, FieldVector]]
+              val to = GeometryFields.wrap(toVector).asInstanceOf[GeometryVector[Geometry, FieldVector]]
+              (fromIndex: Int, toIndex: Int) => from.transfer(fromIndex, toIndex, to)
+            } else {
+              val transfer = fromVector.makeTransferPair(toVector)
+              (fromIndex: Int, toIndex: Int) => transfer.copyValueSafe(fromIndex, toIndex)
             }
-          } else if (classOf[Geometry].isAssignableFrom(sft.getDescriptor(fromVector.getField.getName).getType.getBinding)) {
-            // geometry vectors use FixedSizeList vectors, for which transfer pairs aren't implemented
-            val from = GeometryFields.wrap(fromVector).asInstanceOf[GeometryVector[Geometry, FieldVector]]
-            val to = GeometryFields.wrap(toVector).asInstanceOf[GeometryVector[Geometry, FieldVector]]
-            (fromIndex: Int, toIndex: Int) => {
-              from.transfer(fromIndex, toIndex, to)
-            }
-          } else {
-            val transfer = fromVector.makeTransferPair(toVector)
-            (fromIndex: Int, toIndex: Int) => transfer.copyValueSafe(fromIndex, toIndex)
           }
+          val mapVector = toLoad.underlying
+          val dict = dictionaries.get(sortBy)
+          val merger = ArrowAttributeReader(sft.getDescriptor(sortBy), mapVector.getChild(sortBy), dict, encoding) match {
+            case r: ArrowDictionaryReader => new DictionaryBatchMerger(toLoad, transfers, r, mappings.get(sortBy).orNull)
+            case r: ArrowDateReader => new DateBatchMerger(toLoad, transfers, r)
+            case r => new AttributeBatchMerger(toLoad, transfers, r)
+          }
+          queue.add(merger.asInstanceOf[BatchMerger[Any]])
         }
-        val mapVector = toLoad.underlying
-        val dict = dictionaries.get(sortBy)
-        val sortReader = ArrowAttributeReader(sft.getDescriptor(sortBy), mapVector.getChild(sortBy), dict, encoding)
-        mergeBuilder += ((toLoad, sortReader, transfers, mappings.get(sortBy).orNull))
-      }
-    }
-
-    val toMerge = mergeBuilder.result()
-
-    // we do a merge sort of each batch
-    // sorted queue of [(current batch value, number of the batch, current index in that batch)]
-    val queue: PriorityQueue[(AnyRef, Int, Int)] = {
-      val o: Ordering[(AnyRef, Int, Int)] = if (reverse) { queueOrdering.reverse } else { queueOrdering }
-      new PriorityQueue[(AnyRef, Int, Int)](o)
-    }
-
-    toMerge.foreachIndex { case ((vector, sort, _, mappings), i) =>
-      if (vector.reader.getValueCount > 0) {
-        queue.add((getSortAttribute(sort, mappings, 0), i, 0))
       }
     }
 
@@ -505,16 +489,12 @@ object DeltaWriter extends StrictLogging {
         var resultIndex = 0
         // copy the next sorted value and then queue and sort the next element out of the batch we copied from
         do {
-          val (_, batch, i) = queue.remove()
-          val (vector, sort, transfers, mappings) = toMerge(batch)
-          transfers.foreach(_.apply(i, resultIndex))
+          val next = queue.remove()
+          if (next.transfer(resultIndex)) {
+            queue.add(next)
+          }
           result.underlying.setIndexDefined(resultIndex)
           resultIndex += 1
-          val nextBatchIndex = i + 1
-          if (vector.reader.getValueCount > nextBatchIndex) {
-            val value = getSortAttribute(sort, mappings, nextBatchIndex)
-            queue.add((value, batch, nextBatchIndex))
-          }
         } while (!queue.isEmpty && resultIndex < batchSize)
 
         if (writtenHeader) {
@@ -545,7 +525,7 @@ object DeltaWriter extends StrictLogging {
 
       override def close(): Unit = synchronized {
         CloseWithLogging(result)
-        toMerge.foreach { case (vector, _,  _, _) => CloseWithLogging(vector) }
+        CloseWithLogging(cleanup)
         CloseWithLogging(mergedDictionaries)
       }
     }
@@ -751,6 +731,74 @@ object DeltaWriter extends StrictLogging {
                                       attribute: ArrowAttributeWriter,
                                       writer: BatchWriter,
                                       values: scala.collection.mutable.Map[AnyRef, Integer])
+
+  private object BatchMergerOrdering extends Ordering[BatchMerger[Any]] {
+    override def compare(x: BatchMerger[Any], y: BatchMerger[Any]): Int = x.compare(y)
+  }
+
+  private abstract class BatchMerger[T](
+      vector: SimpleFeatureVector,
+      transfers: Seq[(Int, Int) => Unit]
+    ) extends Ordered[T] {
+
+    protected var index: Int = 0
+
+    def transfer(to: Int): Boolean = {
+      transfers.foreach(_.apply(index, to))
+      index += 1
+      if (vector.reader.getValueCount > index) {
+        load()
+        true
+      } else {
+        false
+      }
+    }
+
+    protected def load(): Unit
+  }
+
+  private class DictionaryBatchMerger(
+      vector: SimpleFeatureVector,
+      transfers: Seq[(Int, Int) => Unit],
+      sort: ArrowDictionaryReader,
+      dictionaryMappings: scala.collection.Map[Integer, Integer]
+    ) extends BatchMerger[DictionaryBatchMerger](vector, transfers) {
+
+    private var value: Int = dictionaryMappings(sort.getEncoded(0))
+
+    override protected def load(): Unit = {
+      // since we've sorted the dictionaries, we can just compare the encoded index values
+      value = dictionaryMappings(sort.getEncoded(index))
+    }
+
+    override def compare(that: DictionaryBatchMerger): Int = java.lang.Integer.compare(value, that.value)
+  }
+
+  private class DateBatchMerger(
+      vector: SimpleFeatureVector,
+      transfers: Seq[(Int, Int) => Unit],
+      sort: ArrowDateReader
+    ) extends BatchMerger[DateBatchMerger](vector, transfers) {
+
+    private var value: Long = sort.getTime(0)
+
+    override protected def load(): Unit = value = sort.getTime(index)
+
+    override def compare(that: DateBatchMerger): Int = java.lang.Long.compare(value, that.value)
+  }
+
+  private class AttributeBatchMerger(
+      vector: SimpleFeatureVector,
+      transfers: Seq[(Int, Int) => Unit],
+      sort: ArrowAttributeReader
+    ) extends BatchMerger[AttributeBatchMerger](vector, transfers) {
+
+    private var value: Comparable[Any] = sort.apply(0).asInstanceOf[Comparable[Any]]
+
+    override protected def load(): Unit = sort.apply(index).asInstanceOf[Comparable[Any]]
+
+    override def compare(that: AttributeBatchMerger): Int = SimpleFeatureOrdering.nullCompare(value, that.value)
+  }
 
   /**
     * Writes out a 4-byte int with the batch length, then a single batch
