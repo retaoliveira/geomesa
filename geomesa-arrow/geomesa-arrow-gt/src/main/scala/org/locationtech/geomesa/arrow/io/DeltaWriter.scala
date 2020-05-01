@@ -28,6 +28,7 @@ import org.locationtech.geomesa.arrow.io.records.{RecordBatchLoader, RecordBatch
 import org.locationtech.geomesa.arrow.vector.ArrowAttributeReader.ArrowDateReader
 import org.locationtech.geomesa.arrow.vector.SimpleFeatureVector.SimpleFeatureEncoding
 import org.locationtech.geomesa.arrow.vector._
+import org.locationtech.geomesa.features.serialization.ObjectType
 import org.locationtech.geomesa.utils.collection.CloseableIterator
 import org.locationtech.geomesa.utils.geotools.{SimpleFeatureOrdering, SimpleFeatureTypes}
 import org.locationtech.geomesa.utils.index.ByteArrays
@@ -221,10 +222,10 @@ object DeltaWriter extends StrictLogging {
   }
 
   // note: ordering is flipped as higher values come off the queue first
-  private val queueOrdering = new Ordering[(AnyRef, Int, Int)] {
-    override def compare(x: (AnyRef, Int, Int), y: (AnyRef, Int, Int)): Int =
-      SimpleFeatureOrdering.nullCompare(y._1.asInstanceOf[Comparable[Any]], x._1)
-  }
+//  private val queueOrdering = new Ordering[(AnyRef, Int, Int)] {
+//    override def compare(x: (AnyRef, Int, Int), y: (AnyRef, Int, Int)): Int =
+//      SimpleFeatureOrdering.nullCompare(y._1.asInstanceOf[Comparable[Any]], x._1)
+//  }
 
   /**
     * Reduce function for delta records created by DeltaWriter
@@ -274,20 +275,20 @@ object DeltaWriter extends StrictLogging {
       private val loader = new RecordBatchLoader(toLoad.underlying)
       private val unloader = new RecordBatchUnloader(result)
 
-      private val transfers: Seq[(String, (Int, Int, scala.collection.Map[Integer, Integer]) => Unit)] = {
+      private val transfers: Seq[(String, (Int, Int, java.util.Map[Integer, Integer]) => Unit)] = {
         toLoad.underlying.getChildrenFromFields.asScala.map { fromVector =>
           val name = fromVector.getField.getName
           val toVector = result.underlying.getChild(name)
-          val transfer: (Int, Int, scala.collection.Map[Integer, Integer]) => Unit =
+          val transfer: (Int, Int, java.util.Map[Integer, Integer]) => Unit =
             if (fromVector.getField.getDictionary != null) {
               val from = fromVector.asInstanceOf[IntVector]
               val to = toVector.asInstanceOf[IntVector]
-              (fromIndex: Int, toIndex: Int, mapping: scala.collection.Map[Integer, Integer]) => {
+              (fromIndex: Int, toIndex: Int, mapping: java.util.Map[Integer, Integer]) => {
                 val n = from.getObject(fromIndex)
                 if (n == null) {
                   to.setNull(toIndex)
                 } else {
-                  to.setSafe(toIndex, mapping(n))
+                  to.setSafe(toIndex, mapping.get(n))
                 }
               }
             } else if (sft.indexOf(name) != -1 &&
@@ -295,12 +296,12 @@ object DeltaWriter extends StrictLogging {
               // geometry vectors use FixedSizeList vectors, for which transfer pairs aren't implemented
               val from = GeometryFields.wrap(fromVector).asInstanceOf[GeometryVector[Geometry, FieldVector]]
               val to = GeometryFields.wrap(toVector).asInstanceOf[GeometryVector[Geometry, FieldVector]]
-              (fromIndex: Int, toIndex: Int, _: scala.collection.Map[Integer, Integer]) => {
+              (fromIndex: Int, toIndex: Int, _: java.util.Map[Integer, Integer]) => {
                 from.transfer(fromIndex, toIndex, to)
               }
             } else {
               val pair = fromVector.makeTransferPair(toVector)
-              (fromIndex: Int, toIndex: Int, _: scala.collection.Map[Integer, Integer]) => {
+              (fromIndex: Int, toIndex: Int, _: java.util.Map[Integer, Integer]) => {
                 pair.copyValueSafe(fromIndex, toIndex)
               }
             }
@@ -311,7 +312,7 @@ object DeltaWriter extends StrictLogging {
       private val threadIterator = threadedBatches.iterator
       private var threadIndex = -1
       private var batches: Iterator[Array[Byte]] = Iterator.empty
-      private var mappings: Map[String, scala.collection.Map[Integer, Integer]] = _
+      private var mappings: Map[String, java.util.Map[Integer, Integer]] = _
       private var count = 0 // records read in current batch
 
       override def hasNext: Boolean = count < toLoad.reader.getValueCount || loadNextBatch()
@@ -454,7 +455,7 @@ object DeltaWriter extends StrictLogging {
                 if (n == null) {
                   to.setNull(toIndex)
                 } else {
-                  to.setSafe(toIndex, mapping(n))
+                  to.setSafe(toIndex, mapping.get(n))
                 }
               }
             } else if (sft.indexOf(name) != -1 &&
@@ -508,6 +509,10 @@ object DeltaWriter extends StrictLogging {
     }
 
     val merged: CloseableIterator[Array[Byte]] = new CloseableIterator[Array[Byte]] {
+
+      // note: we synchronize the hasNext and close methods so that query timeouts don't asynchronously
+      // close any arrow vectors while they're being loaded/unloaded, as that can cause memory leaks
+
       private var batch: Array[Byte] = _
 
       override def hasNext: Boolean = synchronized {
@@ -546,7 +551,7 @@ object DeltaWriter extends StrictLogging {
       dictionaryFields: Seq[String],
       deltas: Array[Array[Array[Byte]]],
       encoding: SimpleFeatureEncoding): MergedDictionaries = {
-    import org.locationtech.geomesa.utils.conversions.ScalaImplicits.{RichArray, RichTraversableOnce}
+    import org.locationtech.geomesa.utils.conversions.ScalaImplicits.RichArray
 
     val allocator = ArrowAllocator("merge-dictionaries")
 
@@ -554,17 +559,22 @@ object DeltaWriter extends StrictLogging {
       return MergedDictionaries(Map.empty, Map.empty, allocator)
     }
 
+    // calculate our vector bindings/metadata once up front
+    val vectorMetadata = dictionaryFields.toArray.map { name =>
+      val descriptor = sft.getDescriptor(name)
+      val bindings = ObjectType.selectType(descriptor)
+      val metadata = Map(SimpleFeatureVector.DescriptorKey -> SimpleFeatureTypes.encodeDescriptor(sft, descriptor))
+      val factory = VectorFactory(allocator)
+      (name, bindings, metadata, factory)
+    }
+
     // create a vector for each dictionary field
     def createNewVectors: Array[ArrowAttributeReader] = {
-      val builder = Array.newBuilder[ArrowAttributeReader]
-      builder.sizeHint(dictionaryFields.length)
-      dictionaryFields.foreach { f =>
-        val descriptor = sft.getDescriptor(f)
+      vectorMetadata.map { case (name, bindings, metadata, factory) =>
         // use the writer to create the appropriate child vector
-        val vector = ArrowAttributeWriter(sft, descriptor, None, encoding, allocator).vector
-        builder += ArrowAttributeReader(descriptor, vector, None, encoding)
+        val vector = ArrowAttributeWriter(name, bindings, None, metadata, encoding, factory).vector
+        ArrowAttributeReader(bindings, vector, None, encoding)
       }
-      builder.result
     }
 
     // final results
@@ -572,18 +582,23 @@ object DeltaWriter extends StrictLogging {
 
     // re-used queue, gets emptied after each dictionary field
     // [(dictionary value, batch index, index of value in the batch)]
-    val queue = scala.collection.mutable.PriorityQueue.empty[(AnyRef, Int, Int)](queueOrdering)
+    // TODO ordering reverse?
+    val queue = new PriorityQueue[DictionaryMerger](Ordering.ordered[DictionaryMerger])
 
     // merge each threaded delta vector into a single dictionary for that thread
     // Array[(dictionary vector, transfers to result, batch delta mappings)]
-    val allMerges: Array[(Array[ArrowAttributeReader], Array[TransferPair], Array[HashBiMap[Integer, Integer]])] = deltas.map { deltas =>
+//    val allMerges: Array[(Array[ArrowAttributeReader], Array[TransferPair], Array[HashBiMap[Integer, Integer]])] = deltas.map { deltas =>
+    val allMerges: Array[DictionaryMerger] = deltas.mapWithIndex { case (deltas, batch) =>
       // deltas are threaded batches containing partial dictionary vectors
 
       // per-dictionary vectors for our final merged results for this threaded batch
       val dictionaries = createNewVectors
 
+      // tracks the offset for each dictionary, based on the deltas that came before it
+      val offsets = Array.fill(dictionaries.length)(0)
+
       // the delta vectors, each sorted internally
-      val toMerge: Array[(Array[ArrowAttributeReader], Array[TransferPair])] = deltas.map { bytes =>
+      val toMerge: Array[DictionaryMerger] = deltas.map { bytes =>
         val vectors = createNewVectors // per-dictionary vectors from this batch
 
         var i = 0
@@ -598,21 +613,32 @@ object DeltaWriter extends StrictLogging {
           i += 1
         }
         logger.trace(s"dictionary deltas: ${vectors.map(v => Seq.tabulate(v.getValueCount)(v.apply).mkString(",")).mkString(";")}")
-        val transfers = vectors.mapWithIndex { case (v, j) => v.vector.makeTransferPair(dictionaries(j).vector) }
-        (vectors, transfers)
+
+        // copy the current dictionary offsets to account for previous batches
+        val off = Array.ofDim[Int](offsets.length)
+        System.arraycopy(offsets, 0, off, 0, offsets.length)
+
+        val transfers = vectors.mapWithIndex { case (v, j) =>
+          offsets(j) += v.getValueCount // note: side-effect in map - update our offsets for the next batch
+          v.vector.makeTransferPair(dictionaries(j).vector)
+        }
+//        (vectors, transfers)
+
+        DictionaryMerger(vectors, transfers, off, null, -1) // we don't care about the batch number here
       }
 
+      // set the count for each batch so we can offset mappings later
       // batch[dictionary[count]]
-      val offsets: Array[Array[Int]] = Array.tabulate(toMerge.length) { batch =>
-        var i = 0
-        val offset = Array.fill(dictionaries.length)(0)
-        while (i < batch) {
-          // set the count for each batch so we can offset mappings later
-          toMerge(i)._1.foreachIndex { case (v, j) => offset(j) += v.getValueCount }
-          i += 1
-        }
-        offset
-      }
+//      val offsets: Array[Array[Int]] = Array.tabulate(toMerge.length) { batch =>
+//        var i = 0
+//        val offset = Array.fill(dictionaries.length)(0)
+//        while (i < batch) {
+//          // set the count for each batch so we can offset mappings later
+//          toMerge(i).readers.foreachIndex { case (v, j) => offset(j) += v.getValueCount }
+//          i += 1
+//        }
+//        offset
+//      }
 
       val transfers = Array.ofDim[TransferPair](dictionaries.length)
       val mappings = Array.fill(dictionaries.length)(HashBiMap.create[Integer, Integer]())
@@ -620,25 +646,26 @@ object DeltaWriter extends StrictLogging {
       var i = 0 // dictionary field index
       while (i < dictionaries.length) {
         // set initial values in the sorting queue
-        toMerge.foreachIndex { case ((vectors, _), batch) =>
-          if (vectors(i).getValueCount > 0) {
-            queue += ((vectors(i).apply(0), batch, 0))
+        toMerge.foreach { /*case ((vectors, _), batch)*/ merger =>
+          if (merger.setCurrent(i)) {
+            queue.add(merger)
           } else {
-            CloseWithLogging(vectors(i).vector)
+            merger.closeCurrent()
           }
         }
 
         var count = 0
-        while (queue.nonEmpty) {
-          val (_, batch, j) = queue.dequeue()
-          val (vectors, transfers) = toMerge(batch)
-          transfers(i).copyValueSafe(j, count)
-          mappings(i).put(offsets(batch)(i) + j, count)
-          val jpp = j + 1
-          if (jpp < vectors(i).getValueCount) {
-            queue += ((vectors(i).apply(jpp), batch, jpp))
+        while (!queue.isEmpty) {
+//          val (_, batch, j) = queue.dequeue()
+          val merger = queue.remove()
+//          val (vectors, transfers) = toMerge(batch)
+//          transfers(i).copyValueSafe(j, count)
+          merger.transfer(count)
+          mappings(i).put(merger.offset, count)
+          if (merger.advance()) {
+            queue.add(merger)
           } else {
-            CloseWithLogging(vectors(i).vector)
+            merger.closeCurrent()
           }
           count += 1
         }
@@ -647,44 +674,53 @@ object DeltaWriter extends StrictLogging {
         i += 1
       }
 
-      (dictionaries, transfers, mappings)
+//      (dictionaries, transfers, mappings)
+      DictionaryMerger(dictionaries, transfers, Array.empty, mappings, batch)
     }
 
     // now merge the separate threads together
 
     // final mappings - we build up a new map as otherwise we'd get key/value overlaps
     // dictionary(batch(mapping))
-    val mappings = Array.fill(results.length)(Array.fill(allMerges.length)(scala.collection.mutable.Map.empty[Integer, Integer]))
+    val mappings = Array.fill(results.length)(Array.fill(allMerges.length)(new java.util.HashMap[Integer, Integer]()))
 
     results.foreachIndex { case (result, i) =>
-      allMerges.foreachIndex { case ((vectors, _, _), batch) =>
-        if (vectors(i).getValueCount > 0) {
-          queue += ((vectors(i).apply(0), batch, 0))
+//      allMerges.foreachIndex { case ((vectors, _, _), batch) =>
+      allMerges.foreach { merger =>
+        if (merger.setCurrent(i)) {
+          queue.add(merger)
         } else {
-          CloseWithLogging(vectors(i).vector)
+          merger.closeCurrent()
         }
+//        if (vectors(i).getValueCount > 0) {
+//          queue += ((vectors(i).apply(0), batch, 0))
+//        } else {
+//          CloseWithLogging(vectors(i).vector)
+//        }
       }
 
       var count = 0
-      while (queue.nonEmpty) {
-        val (value, batch, j) = queue.dequeue()
-        val (vectors, transfers, mapping) = allMerges.apply(batch)
+      while (!queue.isEmpty) {
+//        val (value, batch, j) = queue.dequeue()
+        val merger = queue.remove()
+//        val (vectors, transfers, mapping) = allMerges.apply(batch)
+
         // check for duplicates
-        if (count == 0 || result.apply(count - 1) != vectors(i).apply(j)) {
-          transfers(i).copyValueSafe(j, count)
+        if (count == 0 || result.apply(count - 1) != merger.value) {
+          merger.transfer(count)
+//          transfers(i).copyValueSafe(j, count)
           count += 1
         }
         // update the dictionary mapping from the per-thread to the global dictionary
-        logger.trace(s"remap $value $batch ${mapping(i)} $j -> ${count - 1}")
-        val remap = mapping(i).inverse().get(j)
+        logger.trace(s"remap ${merger.value} ${merger.batch} ${merger.mappings(i)} ${merger.index} -> ${count - 1}")
+        val remap = merger.mappings(i).inverse().get(merger.index)
         if (remap != null) {
-          mappings(i)(batch).put(remap, count - 1)
+          mappings(i)(merger.batch).put(remap, count - 1)
         }
-        val jpp = j + 1
-        if (jpp < vectors(i).getValueCount) {
-          queue += ((vectors(i).apply(jpp), batch, jpp))
+        if (merger.advance()) {
+          queue.add(merger)
         } else {
-          CloseWithLogging(vectors(i).vector)
+          merger.closeCurrent()
         }
       }
       result.vector.setValueCount(count)
@@ -693,14 +729,14 @@ object DeltaWriter extends StrictLogging {
     // convert from indexed arrays to dictionary-field-keyed maps
     val dictionaryBuilder = Map.newBuilder[String, ArrowDictionary]
     dictionaryBuilder.sizeHint(dictionaryFields.length)
-    val mappingsBuilder = Map.newBuilder[String, Array[scala.collection.Map[Integer, Integer]]]
+    val mappingsBuilder = Map.newBuilder[String, Array[java.util.Map[Integer, Integer]]]
     mappingsBuilder.sizeHint(dictionaryFields.length)
 
-    dictionaryFields.foreachIndex { case (f, i) =>
+    vectorMetadata.foreachIndex { case ((name, bindings, _, _), i) =>
       logger.trace("merged dictionary: " + Seq.tabulate(results(i).getValueCount)(results(i).apply).mkString(","))
       val enc = new DictionaryEncoding(i, true, new ArrowType.Int(32, true))
-      dictionaryBuilder += ((f, ArrowDictionary.create(enc, results(i).vector, sft.getDescriptor(f), encoding)))
-      mappingsBuilder += ((f, mappings(i).asInstanceOf[Array[scala.collection.Map[Integer, Integer]]]))
+      dictionaryBuilder += name -> ArrowDictionary.create(enc, results(i).vector, bindings, encoding)
+      mappingsBuilder += name -> mappings(i).asInstanceOf[Array[java.util.Map[Integer, Integer]]]
     }
 
     val dictionaryMap = dictionaryBuilder.result()
@@ -713,7 +749,7 @@ object DeltaWriter extends StrictLogging {
   // holder for merged dictionaries and mappings from written values to merged values
   private case class MergedDictionaries(
       dictionaries: Map[String, ArrowDictionary],
-      mappings: Map[String, Array[scala.collection.Map[Integer, Integer]]],
+      mappings: Map[String, Array[java.util.Map[Integer, Integer]]],
       allocator: BufferAllocator
     ) extends Closeable {
     override def close(): Unit = {
@@ -722,20 +758,31 @@ object DeltaWriter extends StrictLogging {
     }
   }
 
-  private case class FieldWriter(name: String,
-                                 index: Int,
-                                 attribute: ArrowAttributeWriter,
-                                 dictionary: Option[DictionaryWriter] = None)
+  private case class FieldWriter(
+      name: String,
+      index: Int,
+      attribute: ArrowAttributeWriter,
+      dictionary: Option[DictionaryWriter] = None
+    )
 
-  private case class DictionaryWriter(index: Int,
-                                      attribute: ArrowAttributeWriter,
-                                      writer: BatchWriter,
-                                      values: scala.collection.mutable.Map[AnyRef, Integer])
+  private case class DictionaryWriter(
+      index: Int,
+      attribute: ArrowAttributeWriter,
+      writer: BatchWriter,
+      values: scala.collection.mutable.Map[AnyRef, Integer]
+    )
 
   private object BatchMergerOrdering extends Ordering[BatchMerger[Any]] {
     override def compare(x: BatchMerger[Any], y: BatchMerger[Any]): Int = x.compare(y)
   }
 
+  /**
+   * Tracks sorted merging of delta record batches
+   *
+   * @param vector vector for this batch
+   * @param transfers transfer functions to the result batch
+   * @tparam T type param
+   */
   private abstract class BatchMerger[T](
       vector: SimpleFeatureVector,
       transfers: Seq[(Int, Int) => Unit]
@@ -761,14 +808,14 @@ object DeltaWriter extends StrictLogging {
       vector: SimpleFeatureVector,
       transfers: Seq[(Int, Int) => Unit],
       sort: ArrowDictionaryReader,
-      dictionaryMappings: scala.collection.Map[Integer, Integer]
+      dictionaryMappings: java.util.Map[Integer, Integer]
     ) extends BatchMerger[DictionaryBatchMerger](vector, transfers) {
 
-    private var value: Int = dictionaryMappings(sort.getEncoded(0))
+    private var value: Int = dictionaryMappings.get(sort.getEncoded(0))
 
     override protected def load(): Unit = {
       // since we've sorted the dictionaries, we can just compare the encoded index values
-      value = dictionaryMappings(sort.getEncoded(index))
+      value = dictionaryMappings.get(sort.getEncoded(index))
     }
 
     override def compare(that: DictionaryBatchMerger): Int = java.lang.Integer.compare(value, that.value)
@@ -798,6 +845,57 @@ object DeltaWriter extends StrictLogging {
     override protected def load(): Unit = sort.apply(index).asInstanceOf[Comparable[Any]]
 
     override def compare(that: AttributeBatchMerger): Int = SimpleFeatureOrdering.nullCompare(value, that.value)
+  }
+
+  /**
+   *
+   * @param readers
+   * @param transfers
+   * @param offsets
+   * @param mappings
+   * @param batch
+   */
+  case class DictionaryMerger(
+      readers: Array[ArrowAttributeReader],
+      transfers: Array[TransferPair],
+      offsets: Array[Int],
+      mappings: Array[HashBiMap[Integer, Integer]],
+      batch: Int
+    ) extends Ordered[DictionaryMerger] {
+
+    private var current: Int = 0
+    private var _index: Int = 0
+    private var _value: Comparable[Any] = _
+
+    def index: Int = _index
+
+    def setCurrent(i: Int): Boolean = {
+      current = i
+      _index = -1
+      advance()
+    }
+
+    def value: Comparable[Any] = _value
+
+    def offset: Int = offsets(current) + _index
+
+    def transfer(to: Int): Unit = transfers(current).copyValueSafe(_index, to)
+
+    def advance(): Boolean = {
+      _index += 1
+      if (readers(current).getValueCount > _index) {
+        _value = readers(current).apply(_index).asInstanceOf[Comparable[Any]]
+        true
+      } else {
+        _value = null
+        false
+      }
+    }
+
+    def closeCurrent(): Unit = CloseWithLogging(readers(current).vector)
+
+    override def compare(that: DictionaryMerger): Int = SimpleFeatureOrdering.nullCompare(_value, that._value)
+
   }
 
   /**
