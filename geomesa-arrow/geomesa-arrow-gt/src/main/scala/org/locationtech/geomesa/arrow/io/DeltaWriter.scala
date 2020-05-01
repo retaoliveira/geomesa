@@ -60,7 +60,7 @@ class DeltaWriter(
 
   import DeltaWriter._
 
-  import scala.collection.JavaConversions._
+  import scala.collection.JavaConverters._
 
   private val allocator = ArrowAllocator("delta-writer")
 
@@ -79,21 +79,26 @@ class DeltaWriter(
 
   private val idWriter = ArrowAttributeWriter.id(sft, encoding, vector)
 
-  private val writers = sft.getAttributeDescriptors.map { descriptor =>
+  private val writers = sft.getAttributeDescriptors.asScala.map { descriptor =>
     val name = descriptor.getLocalName
-    val isDictionary = dictionaryFields.contains(name)
-    val desc = if (isDictionary) { SimpleFeatureTypes.createDescriptor(s"$name:Integer") } else { descriptor }
-    val attribute = ArrowAttributeWriter(sft, desc, None, encoding, vector)
+    val bindings = ObjectType.selectType(descriptor)
+    val metadata = Map(SimpleFeatureVector.DescriptorKey -> SimpleFeatureTypes.encodeDescriptor(sft, descriptor))
 
-    val dictionary = if (!isDictionary) { None } else {
-      val attribute = ArrowAttributeWriter(sft, descriptor, None, encoding, allocator)
-      val writer = new BatchWriter(attribute.vector)
-      attribute.vector.setInitialCapacity(initialCapacity)
-      attribute.vector.allocateNew()
-      Some(DictionaryWriter(sft.indexOf(name), attribute, writer, scala.collection.mutable.Map.empty))
+    if (dictionaryFields.contains(name)) {
+      val dictMetadata = Map(SimpleFeatureVector.DescriptorKey -> s"$name:Integer")
+      val attribute = ArrowAttributeWriter(name, Seq(ObjectType.INT), None, dictMetadata, encoding, VectorFactory(vector))
+      val dictionary = {
+        val attribute = ArrowAttributeWriter(name, bindings, None, metadata, encoding, VectorFactory(allocator))
+        val writer = new BatchWriter(attribute.vector)
+        attribute.vector.setInitialCapacity(initialCapacity)
+        attribute.vector.allocateNew()
+        Some(DictionaryWriter(sft.indexOf(name), attribute, writer, scala.collection.mutable.Map.empty))
+      }
+      FieldWriter(name, sft.indexOf(name), attribute, dictionary)
+    } else {
+      val attribute = ArrowAttributeWriter(name, bindings, None, metadata, encoding, VectorFactory(vector))
+      FieldWriter(name, sft.indexOf(name), attribute, None)
     }
-
-    FieldWriter(name, sft.indexOf(name), attribute, dictionary)
   }
 
   // writer per-dictionary
@@ -142,9 +147,10 @@ class DeltaWriter(
 
     // write out the dictionaries
 
+    // come up with the delta of new dictionary values
+    val delta = new java.util.TreeSet[AnyRef](dictionaryOrdering)
+
     dictionaryWriters.foreach { dictionary =>
-      // come up with the delta of new dictionary values
-      val delta = scala.collection.mutable.SortedSet.empty[AnyRef](dictionaryOrdering)
       var i = 0
       while (i < count) {
         val value = features(i).getAttribute(dictionary.index)
@@ -156,7 +162,7 @@ class DeltaWriter(
       val size = dictionary.values.size
       i = 0
       // update the dictionary mappings, and write the new values to the vector
-      delta.foreach { n =>
+      delta.asScala.foreach { n =>
         dictionary.values.put(n, i + size)
         dictionary.attribute.apply(i, n)
         i += 1
@@ -165,6 +171,7 @@ class DeltaWriter(
       dictionary.attribute.setValueCount(i)
       logger.trace(s"$threadingKey writing dictionary delta with $i values")
       dictionary.writer.writeBatch(i, result)
+      delta.clear()
     }
 
     // set feature ids in the vector
@@ -220,12 +227,6 @@ object DeltaWriter extends StrictLogging {
     override def compare(x: AnyRef, y: AnyRef): Int =
       SimpleFeatureOrdering.nullCompare(x.asInstanceOf[Comparable[Any]], y)
   }
-
-  // note: ordering is flipped as higher values come off the queue first
-//  private val queueOrdering = new Ordering[(AnyRef, Int, Int)] {
-//    override def compare(x: (AnyRef, Int, Int), y: (AnyRef, Int, Int)): Int =
-//      SimpleFeatureOrdering.nullCompare(y._1.asInstanceOf[Comparable[Any]], x._1)
-//  }
 
   /**
     * Reduce function for delta records created by DeltaWriter
@@ -582,7 +583,6 @@ object DeltaWriter extends StrictLogging {
 
     // re-used queue, gets emptied after each dictionary field
     // [(dictionary value, batch index, index of value in the batch)]
-    // TODO ordering reverse?
     val queue = new PriorityQueue[DictionaryMerger](Ordering.ordered[DictionaryMerger])
 
     // merge each threaded delta vector into a single dictionary for that thread
@@ -646,26 +646,19 @@ object DeltaWriter extends StrictLogging {
       var i = 0 // dictionary field index
       while (i < dictionaries.length) {
         // set initial values in the sorting queue
-        toMerge.foreach { /*case ((vectors, _), batch)*/ merger =>
+        toMerge.foreach { merger =>
           if (merger.setCurrent(i)) {
             queue.add(merger)
-          } else {
-            merger.closeCurrent()
           }
         }
 
         var count = 0
         while (!queue.isEmpty) {
-//          val (_, batch, j) = queue.dequeue()
           val merger = queue.remove()
-//          val (vectors, transfers) = toMerge(batch)
-//          transfers(i).copyValueSafe(j, count)
           merger.transfer(count)
           mappings(i).put(merger.offset, count)
           if (merger.advance()) {
             queue.add(merger)
-          } else {
-            merger.closeCurrent()
           }
           count += 1
         }
@@ -685,30 +678,18 @@ object DeltaWriter extends StrictLogging {
     val mappings = Array.fill(results.length)(Array.fill(allMerges.length)(new java.util.HashMap[Integer, Integer]()))
 
     results.foreachIndex { case (result, i) =>
-//      allMerges.foreachIndex { case ((vectors, _, _), batch) =>
       allMerges.foreach { merger =>
         if (merger.setCurrent(i)) {
           queue.add(merger)
-        } else {
-          merger.closeCurrent()
         }
-//        if (vectors(i).getValueCount > 0) {
-//          queue += ((vectors(i).apply(0), batch, 0))
-//        } else {
-//          CloseWithLogging(vectors(i).vector)
-//        }
       }
 
       var count = 0
       while (!queue.isEmpty) {
-//        val (value, batch, j) = queue.dequeue()
         val merger = queue.remove()
-//        val (vectors, transfers, mapping) = allMerges.apply(batch)
-
         // check for duplicates
         if (count == 0 || result.apply(count - 1) != merger.value) {
           merger.transfer(count)
-//          transfers(i).copyValueSafe(j, count)
           count += 1
         }
         // update the dictionary mapping from the per-thread to the global dictionary
@@ -719,8 +700,6 @@ object DeltaWriter extends StrictLogging {
         }
         if (merger.advance()) {
           queue.add(merger)
-        } else {
-          merger.closeCurrent()
         }
       }
       result.vector.setValueCount(count)
@@ -842,18 +821,20 @@ object DeltaWriter extends StrictLogging {
 
     private var value: Comparable[Any] = sort.apply(0).asInstanceOf[Comparable[Any]]
 
-    override protected def load(): Unit = sort.apply(index).asInstanceOf[Comparable[Any]]
+    override protected def load(): Unit = value = sort.apply(index).asInstanceOf[Comparable[Any]]
 
     override def compare(that: AttributeBatchMerger): Int = SimpleFeatureOrdering.nullCompare(value, that.value)
   }
 
   /**
+   * Dictionary merger for tracking threaded delta batches. Each member variable is an array, with
+   * one entry per dictionary field
    *
-   * @param readers
-   * @param transfers
-   * @param offsets
-   * @param mappings
-   * @param batch
+   * @param readers attribute readers for the dictionary values
+   * @param transfers transfers for the dictionary vectors
+   * @param offsets dictionary offsets based on the number of threaded delta batches
+   * @param mappings mappings from the local threaded batch dictionary to the global dictionary
+   * @param batch the batch number
    */
   case class DictionaryMerger(
       readers: Array[ArrowAttributeReader],
@@ -867,20 +848,51 @@ object DeltaWriter extends StrictLogging {
     private var _index: Int = 0
     private var _value: Comparable[Any] = _
 
+    /**
+     * The read position of the current dictionary
+     *
+     * @return
+     */
     def index: Int = _index
 
+    /**
+     * The current dictionary value
+     *
+     * @return
+     */
+    def value: Comparable[Any] = _value
+
+    /**
+     * The global offset of the current dictionary, based on the batch threading and the current read position
+     *
+     * @return
+     */
+    def offset: Int = offsets(current) + _index
+
+    /**
+     * Set the current dictionary to operate on, and reads the first value
+     *
+     * @param i dictionary index
+     * @return true if the dictionary has any values to read
+     */
     def setCurrent(i: Int): Boolean = {
       current = i
       _index = -1
       advance()
     }
 
-    def value: Comparable[Any] = _value
-
-    def offset: Int = offsets(current) + _index
-
+    /**
+     * Transfer the current dictionary/value to a new vector
+     *
+     * @param to destination index to transfer to
+     */
     def transfer(to: Int): Unit = transfers(current).copyValueSafe(_index, to)
 
+    /**
+     * Read the next value from the current dictionary. Closes the current dictionary if there are no more values.
+     *
+     * @return true if there are more values
+     */
     def advance(): Boolean = {
       _index += 1
       if (readers(current).getValueCount > _index) {
@@ -888,14 +900,12 @@ object DeltaWriter extends StrictLogging {
         true
       } else {
         _value = null
+        CloseWithLogging(readers(current).vector)
         false
       }
     }
 
-    def closeCurrent(): Unit = CloseWithLogging(readers(current).vector)
-
     override def compare(that: DictionaryMerger): Int = SimpleFeatureOrdering.nullCompare(_value, that._value)
-
   }
 
   /**
